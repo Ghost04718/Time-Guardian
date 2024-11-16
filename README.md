@@ -75,8 +75,6 @@ Contributions are welcome! Please fork the repository and submit a pull request 
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-## Author
+## Data Privacy
 
-Adam Chen
-
-For more information, visit the [homepage](https://ghost04718.github.io/).
+All user data will be stored locally.
