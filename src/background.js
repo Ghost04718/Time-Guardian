@@ -6,8 +6,10 @@ const DEFAULT_SETTINGS = {
   notificationInterval: 3,
   notificationDuration: 45000, // 45 seconds
   maxSnoozeMinutes: 180,
-  defaultSnoozeOptions: [10, 30],
-  apiKey: null
+  defaultSnoozeOptions: [5, 15],
+  apiKey: null,
+  defaultPrompt: 'Generate a short, friendly time reminder with emojis.',
+  customPrompt: null
 };
 
 // State management with TypeScript-like interface
@@ -96,6 +98,20 @@ class GeminiManager {
     this.model = null;
   }
 
+  async validateApiKey(apiKey) {
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-8b" });
+      
+      // 尝试生成一个简单的测试消息来验证 API key
+      const result = await model.generateContent("Hello");
+      return result?.response ? true : false;
+    } catch (error) {
+      console.error('API key validation failed:', error);
+      return false;
+    }
+  }
+
   init(apiKey) {
     if (!apiKey) {
       console.error('No API key available');
@@ -128,12 +144,16 @@ class GeminiManager {
     }
 
     try {
-      const prompt = `Based on the webpage title "${title}", URL "${url}" and current time "${timeString}", 
-        generate a short, friendly reminder about time management. If it seems to be a work-related page, 
-        encourage productivity. If it's entertainment, suggest them going back to work. 
-        Keep it under 100 characters. Use some emojis.`;
+      let promptTemplate = 'Based on the webpage title "{title}", URL "{url}" and current time "{timeString}", ';
+      const promptContent = state.customPrompt || state.defaultPrompt;
+      promptTemplate += promptContent;
+      
+      const finalPrompt = promptTemplate
+        .replace('{title}', title)
+        .replace('{url}', url)
+        .replace('{timeString}', timeString);
 
-      const result = await this.model.generateContent(prompt);
+      const result = await this.model.generateContent(finalPrompt);
       
       if (!result?.response) {
         throw new Error('Invalid response structure from Gemini');
@@ -180,49 +200,100 @@ class AlarmManager {
     }
   }
 
-  static async setup(minutes = state.notificationInterval, immediately = false) {
+  static async setup(minutes = state.notificationInterval, immediately = false, nextTime = null) {
     try {
-      // Clear existing alarms
-      await this.cleanup();
-      
+      if (minutes <= 0 || minutes > state.maxSnoozeMinutes) {
+        console.error('Invalid interval:', minutes);
+        return false;
+      }
+
+      if (nextTime && nextTime <= Date.now()) {
+        console.error('Next time must be in the future');
+        return false;
+      }
+
+      // 检查是否已存在相同的闹钟
+      const existingAlarm = await chrome.alarms.get(this.ALARM_NAME);
+      if (existingAlarm) {
+        const sameTime = nextTime && Math.abs(existingAlarm.scheduledTime - nextTime) < 1000;
+        const sameInterval = !nextTime && existingAlarm.periodInMinutes === minutes;
+        if (sameTime || sameInterval) {
+          console.log('Identical alarm already exists');
+          return true;
+        }
+      }
+
+      // 使用原子操作来更新状态和创建闹钟
+      const updates = {
+        nextNotificationTime: null  // 先清除旧的时间
+      };
+      await StorageManager.updateSettings(updates);
+      state.nextNotificationTime = null;
+
       if (!state.isActive) {
         console.log('Notifications inactive, no new alarm created');
-        return;
+        return false;
       }
+
+      const now = Date.now();
+      const actualNextTime = nextTime || (immediately ? now : now + minutes * 60000);
 
       const alarmInfo = {
         periodInMinutes: minutes
       };
 
-      if (immediately) {
-        alarmInfo.when = Date.now();
+      if (nextTime || immediately) {
+        alarmInfo.when = actualNextTime;
       }
 
-      await chrome.alarms.create(this.ALARM_NAME, alarmInfo);
-      console.log('Created new alarm:', alarmInfo);
+      try {
+        await chrome.alarms.create(this.ALARM_NAME, alarmInfo);
+        console.log('Created new alarm:', alarmInfo);
 
-      const success = await StorageManager.updateSettings({ nextNotificationTime: Date.now() + minutes * 60000 });
-      if (success) {
-        console.log('Next notification time updated:', new Date(state.nextNotificationTime).toLocaleString());
+        const success = await StorageManager.updateSettings({ 
+          nextNotificationTime: actualNextTime 
+        });
+        
+        if (success) {
+          state.nextNotificationTime = actualNextTime;
+          console.log('Next notification time updated:', new Date(state.nextNotificationTime).toLocaleString());
+          await this.verifySchedule();
+          return true;
+        }
+
+        return false;
+      } catch (error) {
+        console.error('Failed to create alarm:', error);
+        throw error;
       }
-      
-      await this.verifySchedule();
     } catch (error) {
       console.error('Error in setupAlarm:', error);
+      throw error;
     }
   }
 
   static async cleanup() {
-    const alarms = await chrome.alarms.getAll();
-    const timeAlarms = alarms.filter(a => a.name === this.ALARM_NAME);
-    
-    for (const alarm of timeAlarms) {
-      await chrome.alarms.clear(alarm.name);
-      console.log('Cleared alarm:', alarm.name);
-    }
-    const success = await StorageManager.updateSettings({ nextNotificationTime: null });
-    if (success) {
-      console.log('Next notification time cleared');
+    try {
+      const alarms = await chrome.alarms.getAll();
+      const timeAlarms = alarms.filter(a => a.name === this.ALARM_NAME);
+      
+      for (const alarm of timeAlarms) {
+        await chrome.alarms.clear(alarm.name);
+        console.log('Cleared alarm:', alarm.name);
+      }
+      
+      const success = await StorageManager.updateSettings({ nextNotificationTime: null });
+      if (success) {
+        state.nextNotificationTime = null;
+        console.log('Next notification time cleared');
+        return true;
+      } else {
+        console.error('Failed to clear next notification time');
+        return false;
+      }
+    } catch (error) {
+      console.error('Error in cleanup:', error);
+      throw error;
     }
   }
 }
@@ -265,7 +336,18 @@ class NotificationManager {
     }
 
     if (!message) {
-      message = `Current time is ${timeString}.\nNext notification in ${state.notificationInterval} minutes.`;
+      let nextTime = state.notificationInterval;
+      if (state.nextNotificationTime) {
+        const timeLeft = state.nextNotificationTime - Date.now();
+        if (timeLeft > 0) {
+          const minutesLeft = Math.floor(timeLeft / 60000);
+          const secondsLeft = Math.floor((timeLeft % 60000) / 1000);
+          nextTime = minutesLeft > 0 ? 
+            `${minutesLeft}m ${secondsLeft}s` : 
+            `${secondsLeft}s`;
+        }
+      }
+      message = `⏰ Time Check: ${timeString}\n⏱️ Next reminder in ${typeof nextTime === 'string' ? nextTime : nextTime + ' minutes'}\n💡 Click buttons below to snooze`;
     }
 
     try {
@@ -275,7 +357,7 @@ class NotificationManager {
         title: this.title,
         message,
         buttons: state.defaultSnoozeOptions.map(minutes => ({
-          title: `Snooze ${minutes} minutes`
+          title: `Snooze ${minutes}m`
         })),
         requireInteraction: false,
         silent: !state.soundEnabled,
@@ -299,24 +381,40 @@ class NotificationManager {
   }
 
   async snooze(minutes) {
-    if (minutes > state.maxSnoozeMinutes) return;
+    if (minutes > state.maxSnoozeMinutes) {
+      console.error('Snooze duration exceeds maximum allowed time');
+      return false;
+    }
 
     try {
       // Calculate new snooze options
       const newSnoozeOptions = [
-        state.defaultSnoozeOptions[1],
-        minutes
+        Math.min(minutes, state.defaultSnoozeOptions[1]),
+        Math.max(minutes, state.defaultSnoozeOptions[1])
       ];
 
       // Update storage with new values
-      await StorageManager.updateSettings({
+      const success = await StorageManager.updateSettings({
         defaultSnoozeOptions: newSnoozeOptions,
         nextNotificationTime: Date.now() + minutes * 60000
       });
 
-      await AlarmManager.setup(minutes=minutes);
+      if (!success) {
+        throw new Error('Failed to update snooze settings');
+      }
+
+      // 更新内存中的状态
+      state.defaultSnoozeOptions = newSnoozeOptions;
+
+      const alarmSuccess = await AlarmManager.setup(minutes);
+      if (!alarmSuccess) {
+        throw new Error('Failed to setup snooze alarm');
+      }
+
+      return true;
     } catch (error) {
       console.error('Error in snooze:', error);
+      return false;
     }
   }
 }
@@ -329,97 +427,169 @@ class MessageHandler {
     const handlers = {
       snooze: async ({ minutes }) => {
         if (minutes <= state.maxSnoozeMinutes) {
+          try {
             const success = await notificationManager.snooze(minutes);
             if (success) {
-            return { success: true };
+              return { success: true };
             }
             return { 
-            success: false, 
-            error: 'Failed to snooze notification' 
+              success: false, 
+              error: 'Failed to snooze notification' 
             };
+          } catch (error) {
+            console.error('Snooze error:', error);
+            return {
+              success: false,
+              error: 'Failed to process snooze request'
+            };
+          }
         }
         return { 
           success: false, 
           error: 'Snooze duration exceeds maximum allowed time' 
         };
       },
-
       notification: async ({ minutes }) => {
         if (minutes <= state.maxSnoozeMinutes) {
-          const updates = { notificationInterval: minutes, nextNotificationTime: Date.now() + minutes * 60000 };
-          const success = await StorageManager.updateSettings(updates);
-          
-          if (success) {
-            await AlarmManager.setup(minutes = minutes);
-            return { success: true };
+          try {
+            const updates = { notificationInterval: minutes, nextNotificationTime: Date.now() + minutes * 60000 };
+            const success = await StorageManager.updateSettings(updates);
+            
+            if (success) {
+              state.notificationInterval = minutes;
+              const alarmSuccess = await AlarmManager.setup(minutes);
+              if (!alarmSuccess) {
+                throw new Error('Failed to setup notification alarm');
+              }
+              return { success: true };
+            }
+            return { 
+              success: false, 
+              error: 'Failed to save notification interval' 
+            };
+          } catch (error) {
+            console.error('Notification setup error:', error);
+            return {
+              success: false,
+              error: 'Failed to setup notifications: ' + error.message
+            };
           }
-          return { 
-            success: false, 
-            error: 'Failed to save notification interval' 
-          };
         }
         return { 
           success: false, 
           error: 'Interval exceeds maximum allowed time' 
         };
       },
-
       saveApiKey: async ({ apiKey }) => {
         try {
+          if (!apiKey.trim()) {
+            return {
+              success: false,
+              error: 'Please enter your Gemini API key'
+            };
+          }
+
+          if (!navigator.onLine) {
+            return {
+              success: false,
+              error: 'No internet connection. Please check your network and try again'
+            };
+          }
+
+          const isValid = await geminiManager.validateApiKey(apiKey);
+          if (!isValid) {
+            return {
+              success: false,
+              error: 'Invalid API key. Please check if you have copied the correct Gemini API key'
+            };
+          }
+
           const success = await StorageManager.updateSettings({ apiKey });
           if (success) {
-            geminiManager.init(apiKey);
+            const initSuccess = geminiManager.init(apiKey);
+            if (!initSuccess) {
+              return {
+                success: false,
+                error: 'Could not connect to Gemini API. Please check your internet connection'
+              };
+            }
+            state.apiKey = apiKey;
             return { success: true };
           }
           return { 
             success: false, 
-            error: 'Failed to save API key' 
+            error: 'Could not save API key. Please try again' 
           };
         } catch (error) {
+          console.error('API key update error:', error);
           return { 
             success: false, 
-            error: error.message 
+            error: 'Connection error: Please check your internet connection and try again' 
           };
         }
       },
-
       toggle: async ({ isActive }) => {
         try {
           const success = await StorageManager.updateSettings({ isActive });
           if (success) {
+            state.isActive = isActive;
             if (isActive) {
-              await AlarmManager.setup(immediately = true);
+              try {
+                await AlarmManager.setup(undefined, true);
+                return { success: true };
+              } catch (error) {
+                console.error('Failed to setup alarm:', error);
+                return { 
+                  success: false, 
+                  error: 'Failed to start notifications' 
+                };
+              }
             } else {
-              await chrome.alarms.clear(AlarmManager.ALARM_NAME);
+              try {
+                await AlarmManager.cleanup();
+                return { success: true };
+              } catch (error) {
+                console.error('Failed to clear alarm:', error);
+                return { 
+                  success: false, 
+                  error: 'Failed to stop notifications' 
+                };
+              }
             }
-            return { success: true };
           }
           return { 
             success: false, 
-            error: 'Failed to update active status' 
+            error: 'Failed to update notification status' 
           };
         } catch (error) {
+          console.error('Toggle error:', error);
           return { 
             success: false, 
-            error: error.message 
+            error: 'Operation failed: ' + error.message 
           };
         }
       },
-
       updateSound: async ({ enabled }) => {
         try {
           const success = await StorageManager.updateSettings({ 
             soundEnabled: enabled 
           });
-          return { success };
-        } catch (error) {
+          if (success) {
+            state.soundEnabled = enabled;
+            return { success: true };
+          }
           return { 
             success: false, 
-            error: error.message 
+            error: 'Failed to update sound settings' 
+          };
+        } catch (error) {
+          console.error('Sound update error:', error);
+          return { 
+            success: false, 
+            error: 'Failed to update sound settings: ' + error.message 
           };
         }
       },
-
       getSettings: async () => {
         try {
           return { 
@@ -427,12 +597,88 @@ class MessageHandler {
             settings: state 
           };
         } catch (error) {
+          console.error('Get settings error:', error);
           return { 
             success: false, 
-            error: error.message 
+            error: 'Failed to retrieve settings: ' + error.message 
           };
         }
-      }
+      },
+      saveCustomPrompt: async ({ customPrompt }) => {
+        try {
+          const success = await StorageManager.updateSettings({ customPrompt });
+          if (success) {
+            state.customPrompt = customPrompt;
+            return { success: true };
+          }
+          return { 
+            success: false, 
+            error: 'Failed to save custom prompt' 
+          };
+        } catch (error) {
+          console.error('Custom prompt update error:', error);
+          return { 
+            success: false, 
+            error: 'Failed to update custom prompt: ' + error.message 
+          };
+        }
+      },
+      setNextAlert: async ({ minutes }) => {
+        if (!state.isActive) {
+          return {
+            success: false,
+            error: 'Please enable notifications first'
+          };
+        }
+        
+        if (minutes > state.maxSnoozeMinutes) {
+          return { 
+            success: false, 
+            error: `Time cannot exceed ${state.maxSnoozeMinutes} minutes` 
+          };
+        }
+        
+        try {
+          const nextTime = Date.now() + minutes * 60000;
+          if (nextTime <= Date.now()) {
+            return {
+              success: false,
+              error: 'Cannot set notification time in the past'
+            };
+          }
+          
+          // 计算新的贪睡选项
+          const newSnoozeOptions = [
+            Math.min(minutes, state.defaultSnoozeOptions[1]),
+            Math.max(minutes, state.defaultSnoozeOptions[1])
+          ];
+          
+          const success = await StorageManager.updateSettings({ 
+            nextNotificationTime: nextTime,
+            defaultSnoozeOptions: newSnoozeOptions
+          });
+          
+          if (success) {
+            state.nextNotificationTime = nextTime;
+            state.defaultSnoozeOptions = newSnoozeOptions;
+            const alarmSuccess = await AlarmManager.setup(minutes, false, nextTime);
+            if (!alarmSuccess) {
+              throw new Error('Failed to setup next alert');
+            }
+            return { success: true };
+          }
+          return { 
+            success: false, 
+            error: 'Failed to save next alert time' 
+          };
+        } catch (error) {
+          console.error('Next alert setup error:', error);
+          return {
+            success: false,
+            error: 'Failed to set next alert: ' + error.message
+          };
+        }
+      },
     };
 
     try {
@@ -440,11 +686,18 @@ class MessageHandler {
       if (handler) {
         const response = await handler(request);
         sendResponse(response);
+      } else {
+        console.error('Unknown action:', request.action);
+        sendResponse({ 
+          success: false, 
+          error: 'Unknown action requested' 
+        });
       }
     } catch (error) {
+      console.error('Message handler error:', error);
       sendResponse({ 
         success: false, 
-        error: error.message 
+        error: 'Internal error: ' + error.message 
       });
     }
   }

@@ -1,172 +1,305 @@
-const DEFAULT_SETTINGS = {
-  isActive: true,
-  soundEnabled: false,
-  nextNotificationTime: null, // Minutes
-  notificationInterval: 3,
-  maxSnoozeMinutes: 180
-};
-
-let state = { ...DEFAULT_SETTINGS };
-
-class UIManager {
-  static elements = {
-    currentTime: document.getElementById('currentTime'),
-    countdown: document.querySelector('.countdown'),
-    toggleButton: document.getElementById('toggleNotifications'),
-    soundToggle: document.getElementById('soundToggle'),
-    customSnoozeBtn: document.getElementById('customSnoozeBtn'),
-    customNotificationBtn: document.getElementById('customNotificationBtn'),
-    setAPIKeyBtn: document.getElementById('setAPIKeyBtn'),
-    modals: {
-      snooze: document.getElementById('customSnoozeContainer'),
-      notification: document.getElementById('customNotificationContainer'),
-      apiKey: document.getElementById('setAPIKeyContainer')
-    },
-    inputs: {
-      snooze: document.getElementById('customSnoozeMinutes'),
-      notification: document.getElementById('customNotificationMinutes'),
-      apiKey: document.getElementById('APIKey')
-    }
+document.addEventListener('DOMContentLoaded', () => {
+  const state = {
+    isLoading: false,
+    error: null,
+    apiKey: null,
+    notificationInterval: 3,
+    soundEnabled: false,
+    notificationsActive: true,
+    customPrompt: '',
+    nextNotificationTime: null
   };
 
-  static initialize() {
-    this.initializeEventListeners();
-    this.startTimers();
-    this.loadInitialState();
-  }
+  // Elements
+  const notificationIntervalSpan = document.getElementById('notificationInterval');
+  const soundStatusSpan = document.getElementById('soundStatus');
+  const notificationStatusSpan = document.getElementById('notificationStatus');
 
-  static initializeEventListeners() {
-    // Toggle buttons
-    this.elements.toggleButton.addEventListener('click', () => {
-      state.isActive = !state.isActive;
-      this.sendMessage('toggle', { isActive: state.isActive });
-      this.updateToggleButton();
+  const editIntervalBtn = document.getElementById('editIntervalBtn');
+  const toggleSoundBtn = document.getElementById('toggleSoundBtn');
+  const toggleNotificationsBtn = document.getElementById('toggleNotificationsBtn');
+  const editPromptBtn = document.getElementById('editPromptBtn');
+  const editApiKeyBtn = document.getElementById('editApiKeyBtn');
+
+  const intervalModal = document.getElementById('intervalModal');
+  const promptModal = document.getElementById('promptModal');
+  const apiKeyModal = document.getElementById('apiKeyModal');
+
+  const intervalInput = document.getElementById('intervalInput');
+  const promptInput = document.getElementById('promptInput');
+  const apiKeyInput = document.getElementById('apiKeyInput');
+
+  const saveIntervalBtn = document.getElementById('saveIntervalBtn');
+  const savePromptBtn = document.getElementById('savePromptBtn');
+  const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
+
+  // Close modal buttons
+  const closeModalButtons = document.querySelectorAll('.modal-close');
+  closeModalButtons.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const modalId = e.target.dataset.close;
+      hideModal(modalId);
     });
+  });
 
-    this.elements.soundToggle.addEventListener('change', (e) => {
-      state.soundEnabled = e.target.checked;
-      this.sendMessage('updateSound', { enabled: state.soundEnabled });
-    });
-
-    // Modal buttons
-    this.elements.customSnoozeBtn.addEventListener('click', () => 
-      this.toggleModal('snooze'));
-    this.elements.customNotificationBtn.addEventListener('click', () => 
-      this.toggleModal('notification'));
-    this.elements.setAPIKeyBtn.addEventListener('click', () => 
-      this.toggleModal('apiKey'));
-
-    // Set buttons
-    document.getElementById('setCustomSnooze').addEventListener('click', () => 
-      this.handleCustomValue('snooze'));
-    document.getElementById('setCustomNotification').addEventListener('click', () => 
-      this.handleCustomValue('notification'));
-    document.getElementById('setAPIKey').addEventListener('click', () => 
-      this.handleApiKey());
-  }
-
-  static startTimers() {
-    this.updateCurrentTime();
-    setInterval(() => this.updateCurrentTime(), 1000);
-    setInterval(() => this.updateSnoozeStatus(), 1000);
-  }
-
-  static async loadInitialState() {
-    try {
-      const result = await this.sendMessage('getSettings');
-      if (result.success) {
-        state = { ...DEFAULT_SETTINGS, ...result.settings };
-        this.updateUI();
+  // Load initial settings
+  function loadInitialSettings() {
+    state.isLoading = true;
+    document.getElementById('loadingIndicator').style.display = 'flex';
+    updateUIElements();
+    
+    chrome.runtime.sendMessage({ action: 'getSettings' }, (response) => {
+      state.isLoading = false;
+      document.getElementById('loadingIndicator').style.display = 'none';
+      
+      if (response.success) {
+        state.notificationInterval = response.settings.notificationInterval;
+        state.soundEnabled = response.settings.soundEnabled;
+        state.notificationsActive = response.settings.isActive;
+        state.apiKey = response.settings.apiKey;
+        state.customPrompt = response.settings.customPrompt || response.settings.defaultPrompt;
+        state.nextNotificationTime = response.settings.nextNotificationTime;
+        
+        startCountdown();
+      } else {
+        handleError(response.error || 'Could not load settings. Please try reopening the extension');
       }
-    } catch (error) {
-      console.error('Failed to load initial state:', error);
-    }
-  }
-
-  static updateUI() {
-    this.updateToggleButton();
-    this.updateSnoozeStatus();
-    this.elements.soundToggle.checked = state.soundEnabled;
-  }
-
-  static updateCurrentTime() {
-    const now = new Date();
-    const timeString = now.toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit'
+      
+      updateUIElements();
     });
-    this.elements.currentTime.textContent = `Current time: ${timeString}`;
   }
 
-  static async updateSnoozeStatus() {
-    if (!state.isActive) {
-      this.elements.countdown.textContent = 'Paused';
-      return;
-    }
-
-    if (!state.nextNotificationTime) {
-      this.elements.countdown.textContent = 'Active';
-      return;
-    }
-
-    const remaining = Math.max(0, state.nextNotificationTime - Date.now());
-    if (remaining <= 0) {
-      this.elements.countdown.textContent = 'Active';
+  function updateUIElements() {
+    notificationIntervalSpan.textContent = `${state.notificationInterval} minutes`;
+    soundStatusSpan.textContent = state.soundEnabled ? 'Enabled' : 'Disabled';
+    notificationStatusSpan.textContent = state.notificationsActive ? 'Running' : 'Stopped';
+    toggleNotificationsBtn.textContent = state.notificationsActive ? 'Pause' : 'Resume';
+    
+    // 更新下一次通知时间和按钮状态
+    const nextNotificationSpan = document.getElementById('nextNotification');
+    const editNextAlertBtn = document.getElementById('editNextAlertBtn');
+    
+    editNextAlertBtn.disabled = !state.notificationsActive;
+    editNextAlertBtn.style.opacity = state.notificationsActive ? '1' : '0.5';
+    
+    if (state.nextNotificationTime && state.notificationsActive) {
+      const timeLeft = Math.max(0, state.nextNotificationTime - Date.now());
+      const minutesLeft = Math.floor(timeLeft / 60000);
+      const secondsLeft = Math.floor((timeLeft % 60000) / 1000);
+      if (timeLeft <= 0) {
+        nextNotificationSpan.textContent = 'Due now';
+      } else if (minutesLeft > 0) {
+        nextNotificationSpan.textContent = `${minutesLeft}m ${secondsLeft}s`;
+      } else {
+        nextNotificationSpan.textContent = `${secondsLeft}s`;
+      }
     } else {
-      const minutes = Math.floor(remaining / 60000);
-      const seconds = Math.floor((remaining % 60000) / 1000);
-      this.elements.countdown.textContent = `${minutes}m ${seconds}s`;
+      nextNotificationSpan.textContent = state.notificationsActive ? 'Not scheduled' : 'Notifications paused';
     }
+    
+    // 更新 API Key 状态显示
+    const apiKeyStatus = document.getElementById('apiKeyStatus');
+    const editApiKeyBtn = document.getElementById('editApiKeyBtn');
+    
+    apiKeyStatus.textContent = state.apiKey ? 'Connected' : 'Not Set';
+    editApiKeyBtn.textContent = state.apiKey ? 'Reconnect' : 'Set Key';
   }
 
-  static updateToggleButton() {
-    this.elements.toggleButton.innerHTML = `
-      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-        <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-      </svg>
-      ${state.isActive ? 'Notifications Active' : 'Notifications Paused'}
-    `;
-    this.elements.toggleButton.classList.toggle('paused', !state.isActive);
-  }
+  // Event Listeners
+  editIntervalBtn.addEventListener('click', () => {
+    intervalInput.value = state.notificationInterval;
+    showModal('intervalModal');
+  });
 
-  static toggleModal(type) {
-    this.elements.modals[type].classList.toggle('visible');
-  }
-
-  static validateInput(value, type) {
-    const num = parseInt(value);
-    return num > 0 && num <= state.maxSnoozeMinutes;
-  }
-
-  static validateApiKey(apiKey) {
-    const validFormat = /^AIza[0-9A-Za-z-_]{35}$/;
-    return validFormat.test(apiKey);
-  }
-
-  static async handleCustomValue(type) {
-    const value = parseInt(this.elements.inputs[type].value);
-    if (this.validateInput(value)) {
-      await this.sendMessage(type, { minutes: value });
-      this.toggleModal(type);
-      window.close();
+  saveIntervalBtn.addEventListener('click', () => {
+    const interval = parseInt(intervalInput.value);
+    if (isNaN(interval) || interval <= 0 || interval > 180) {
+      handleError('Please enter a valid number between 1 and 180');
+      return;
     }
-  }
-
-  static async handleApiKey() {
-    const apiKey = this.elements.inputs.apiKey.value.trim();
-    if (this.validateApiKey(apiKey)) {
-      await this.sendMessage('saveApiKey', { apiKey });
-      this.toggleModal('apiKey');
-      window.close();
-    }
-  }
-
-  static sendMessage(action, data = {}) {
-    return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ action, ...data }, resolve);
+    
+    chrome.runtime.sendMessage({ 
+      action: 'notification', 
+      minutes: interval 
+    }, (response) => {
+      if (response.success) {
+        state.notificationInterval = interval;
+        updateUIElements();
+        hideModal('intervalModal');
+      } else {
+        handleError(response.error || 'Failed to update interval');
+      }
     });
-  }
-}
+  });
 
-document.addEventListener('DOMContentLoaded', () => UIManager.initialize());
+  toggleSoundBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ 
+      action: 'updateSound', 
+      enabled: !state.soundEnabled 
+    }, (response) => {
+      if (response.success) {
+        state.soundEnabled = !state.soundEnabled;
+        updateUIElements();
+      } else {
+        handleError(response.error || 'Failed to toggle sound');
+      }
+    });
+  });
+
+  toggleNotificationsBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ 
+      action: 'toggle', 
+      isActive: !state.notificationsActive 
+    }, (response) => {
+      if (response.success) {
+        state.notificationsActive = !state.notificationsActive;
+        if (state.notificationsActive) {
+          startCountdown();
+        } else {
+          if (countdownInterval) {
+            clearInterval(countdownInterval);
+            countdownInterval = null;
+          }
+        }
+        updateUIElements();
+      } else {
+        handleError(response.error || 'Failed to toggle notifications');
+      }
+    });
+  });
+
+  editPromptBtn.addEventListener('click', () => {
+    promptInput.value = state.customPrompt;
+    showModal('promptModal');
+  });
+
+  savePromptBtn.addEventListener('click', () => {
+    const customPrompt = promptInput.value.trim();
+    chrome.runtime.sendMessage({ 
+      action: 'saveCustomPrompt', 
+      customPrompt: customPrompt 
+    }, (response) => {
+      if (response.success) {
+        state.customPrompt = customPrompt;
+        hideModal('promptModal');
+      } else {
+        handleError(response.error || 'Failed to save prompt');
+      }
+    });
+  });
+
+  editApiKeyBtn.addEventListener('click', () => {
+    apiKeyInput.value = state.apiKey || '';
+    showModal('apiKeyModal');
+  });
+
+  saveApiKeyBtn.addEventListener('click', () => {
+    const apiKey = apiKeyInput.value.trim();
+    if (!apiKey) {
+      handleError('Please enter your Gemini API key');
+      return;
+    }
+    
+    chrome.runtime.sendMessage({ 
+      action: 'saveApiKey', 
+      apiKey: apiKey 
+    }, (response) => {
+      if (response.success) {
+        state.apiKey = apiKey;
+        updateUIElements();
+        hideModal('apiKeyModal');
+      } else {
+        handleError(response.error || 'Failed to save API key');
+      }
+    });
+  });
+
+  // Initialize
+  loadInitialSettings();
+
+  // 优化错误处理
+  function handleError(error) {
+    const errorToast = document.getElementById('errorToast');
+    errorToast.textContent = error;
+    errorToast.style.display = 'block';
+    
+    setTimeout(() => {
+      errorToast.style.display = 'none';
+    }, 3000);
+  }
+
+  // 打开模态框时添加动画
+  function showModal(modalId) {
+    const modal = document.getElementById(modalId);
+    modal.style.display = 'flex';
+    setTimeout(() => {
+      modal.classList.add('active');
+    }, 10);
+  }
+
+  // 关闭模态框时的动画
+  function hideModal(modalId) {
+    const modal = document.getElementById(modalId);
+    modal.classList.remove('active');
+    setTimeout(() => {
+      modal.style.display = 'none';
+    }, 300);
+  }
+
+  // 添加倒计时更新定时器
+  let countdownInterval;
+
+  function startCountdown() {
+    if (countdownInterval) {
+      clearInterval(countdownInterval);
+    }
+    countdownInterval = setInterval(updateUIElements, 1000);
+  }
+
+  // 在 popup 关闭时清理定时器
+  window.addEventListener('unload', () => {
+    if (countdownInterval) {
+      clearInterval(countdownInterval);
+    }
+  });
+
+  // 添加新的元素引用
+  const editNextAlertBtn = document.getElementById('editNextAlertBtn');
+  const nextAlertModal = document.getElementById('nextAlertModal');
+  const nextAlertInput = document.getElementById('nextAlertInput');
+  const saveNextAlertBtn = document.getElementById('saveNextAlertBtn');
+
+  // 添加事件监听器
+  editNextAlertBtn.addEventListener('click', () => {
+    if (state.nextNotificationTime) {
+      const timeLeft = Math.max(0, state.nextNotificationTime - Date.now());
+      const minutesLeft = Math.ceil(timeLeft / 60000);
+      nextAlertInput.value = minutesLeft;
+    } else {
+      nextAlertInput.value = state.notificationInterval;
+    }
+    showModal('nextAlertModal');
+  });
+
+  saveNextAlertBtn.addEventListener('click', () => {
+    const minutes = parseInt(nextAlertInput.value);
+    if (isNaN(minutes) || minutes <= 0 || minutes > 180) {
+      handleError('Please enter a valid number between 1 and 180');
+      return;
+    }
+    
+    chrome.runtime.sendMessage({ 
+      action: 'setNextAlert', 
+      minutes: minutes 
+    }, (response) => {
+      if (response.success) {
+        state.nextNotificationTime = Date.now() + minutes * 60000;
+        updateUIElements();
+        nextAlertInput.value = '';
+        hideModal('nextAlertModal');
+      } else {
+        handleError(response.error || 'Failed to set next alert time');
+      }
+    });
+  });
+});
